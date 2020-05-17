@@ -32,7 +32,7 @@ func main() {
 }
 
 const port = ":3333"
-const chunkSize = 4 * 1024 * 1024
+const chunkSize = 64 * 1024
 
 func listen(filename string) {
 	fmt.Println("Serving", filename)
@@ -49,11 +49,27 @@ func listen(filename string) {
 	}
 }
 
-func calcChunkSize(chunkIndex, fileSize int64) int64 {
-	if (chunkIndex+1)*chunkSize > fileSize {
-		return fileSize - chunkIndex*chunkSize
+func calcChunkSize(chunkIndex int, fileSize int64) int64 {
+	if int64(chunkIndex+1)*chunkSize > fileSize {
+		return fileSize % chunkSize
 	}
 	return chunkSize
+}
+
+func calcHashes(file *os.File) (hashes []uint32) {
+	stat, _ := file.Stat()
+	size := stat.Size()
+	file.Seek(0, 0)
+	chunks := (size + chunkSize - 1) / chunkSize
+	hashes = make([]uint32, chunks, chunks)
+	for i := range hashes {
+		h := crc32.NewIEEE()
+		if _, err := io.CopyN(h, file, calcChunkSize(i, size)); err != nil {
+			exit("Failed to hash file")
+		}
+		hashes[i] = h.Sum32()
+	}
+	return
 }
 
 func handleConnection(conn net.Conn, filename string) {
@@ -69,23 +85,18 @@ func handleConnection(conn net.Conn, filename string) {
 	fmt.Fprintln(conn, stat.Name())
 	binary.Write(conn, binary.LittleEndian, size)
 	chunks := (size + chunkSize - 1) / chunkSize
-	for i := int64(0); i < chunks; i++ {
-		file.Seek(i*chunkSize, 0)
-		buf := make([]byte, calcChunkSize(i, size), chunkSize)
-		if _, err := io.ReadFull(file, buf); err != nil {
-			exit("Failed to read file")
-		}
-		cksum := crc32.ChecksumIEEE(buf)
-		binary.Write(conn, binary.LittleEndian, cksum)
-		var ok bool
-		if err := binary.Read(r, binary.LittleEndian, &ok); err != nil {
-			break
-		}
-		if ok {
-			continue
-		}
-		if _, err := conn.Write(buf); err != nil {
-			break
+	hashes := calcHashes(file)
+	binary.Write(conn, binary.LittleEndian, hashes)
+	hashOk := make([]bool, chunks, chunks)
+	if err := binary.Read(r, binary.LittleEndian, hashOk); err != nil {
+		return
+	}
+	for i := range hashOk {
+		if !hashOk[i] {
+			file.Seek(int64(i*chunkSize), 0)
+			if _, err := io.CopyN(conn, file, calcChunkSize(i, size)); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -114,28 +125,27 @@ func connect(server string) {
 	defer file.Close()
 	file.Truncate(size)
 	chunks := (size + chunkSize - 1) / chunkSize
+	hashes := make([]uint32, chunks, chunks)
+	hashes2 := calcHashes(file)
+	if err := binary.Read(r, binary.LittleEndian, hashes); err != nil {
+		exit("Failed to read hashes")
+	}
+	hashOk := make([]bool, chunks, chunks)
+	for i := range hashes2 {
+		hashOk[i] = hashes[i] == hashes2[i]
+	}
+	binary.Write(conn, binary.LittleEndian, hashOk)
 	bar := pb.StartNew(int(chunks))
-	for i := int64(0); i < chunks; i++ {
-		var cksum uint32
-		if err := binary.Read(r, binary.LittleEndian, &cksum); err != nil {
-			exit("Failed to read checksum")
-		}
-		file.Seek(i*chunkSize, 0)
-		buf := make([]byte, calcChunkSize(i, size), chunkSize)
-		if _, err := io.ReadFull(file, buf); err == nil {
-			cksum2 := crc32.ChecksumIEEE(buf)
-			if cksum == cksum2 {
-				binary.Write(conn, binary.LittleEndian, true)
-				bar.Increment()
-				continue
+	for i := range hashOk {
+		if !hashOk[i] {
+			file.Seek(int64(i*chunkSize), 0)
+			h := crc32.NewIEEE()
+			if _, err := io.CopyN(file, io.TeeReader(r, h), calcChunkSize(i, size)); err != nil {
+				exit("Failed to read chunk")
 			}
-		}
-		binary.Write(conn, binary.LittleEndian, false)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			exit("Failed to read chunk")
-		}
-		if _, err = file.WriteAt(buf, i*chunkSize); err != nil {
-			exit("Failed to write chunk to file")
+			if h.Sum32() != hashes[i] {
+				exit("Hash mismatch")
+			}
 		}
 		bar.Increment()
 	}
