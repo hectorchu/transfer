@@ -27,7 +27,7 @@ func main() {
 		if len(os.Args) < 3 {
 			exit("Needs filename argument")
 		}
-		if err := listen(os.Args[2]); err != nil {
+		if err := listen(os.Args[2:]); err != nil {
 			exit(err.Error())
 		}
 	} else {
@@ -46,17 +46,19 @@ func main() {
 const port = ":3333"
 const chunkSize = 64 * 1024
 
-func listen(filename string) (err error) {
-	file, err := os.Open(filename)
-	if err != nil {
-		return
-	}
-	fmt.Println("Serving", filename)
+func listen(filenames []string) (err error) {
 	fmt.Print("Calculating hashes...")
-	hashes, err := calcHashes(file)
-	file.Close()
-	if err != nil {
-		return
+	hashes := make([][]uint32, len(filenames))
+	for i, filename := range filenames {
+		file, err := os.Open(filename)
+		if err != nil {
+			return err
+		}
+		hashes[i], err = calcHashes(file)
+		file.Close()
+		if err != nil {
+			return err
+		}
 	}
 	fmt.Println(" done")
 	ln, err := net.Listen("tcp", port)
@@ -69,7 +71,7 @@ func listen(filename string) (err error) {
 		if err != nil {
 			return err
 		}
-		go handleConnection(conn, filename, hashes)
+		go handleConnection(conn, filenames, hashes)
 	}
 }
 
@@ -101,9 +103,20 @@ func calcHashes(file *os.File) (hashes []uint32, err error) {
 	return
 }
 
-func handleConnection(conn net.Conn, filename string, hashes []uint32) (err error) {
+func handleConnection(conn net.Conn, filenames []string, hashes [][]uint32) (err error) {
 	defer conn.Close()
-	r := bufio.NewReader(conn)
+	if err = binary.Write(conn, binary.LittleEndian, int32(len(filenames))); err != nil {
+		return
+	}
+	for i, filename := range filenames {
+		if err = sendFile(conn, filename, hashes[i]); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func sendFile(conn net.Conn, filename string, hashes []uint32) (err error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return
@@ -124,7 +137,7 @@ func handleConnection(conn net.Conn, filename string, hashes []uint32) (err erro
 		return
 	}
 	hashOk := make([]bool, len(hashes))
-	if err = binary.Read(r, binary.LittleEndian, hashOk); err != nil {
+	if err = binary.Read(conn, binary.LittleEndian, hashOk); err != nil {
 		return
 	}
 	for i := range hashOk {
@@ -147,6 +160,19 @@ func connect(server string) (err error) {
 	}
 	defer conn.Close()
 	r := bufio.NewReader(conn)
+	var n int32
+	if err = binary.Read(r, binary.LittleEndian, &n); err != nil {
+		return
+	}
+	for ; n > 0; n-- {
+		if err = recvFile(r, conn); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func recvFile(r *bufio.Reader, w io.Writer) (err error) {
 	filename, err := r.ReadString('\n')
 	if err != nil {
 		return
@@ -178,7 +204,7 @@ func connect(server string) (err error) {
 	for i := range hashes2 {
 		hashOk[i] = hashes[i] == hashes2[i]
 	}
-	if err = binary.Write(conn, binary.LittleEndian, hashOk); err != nil {
+	if err = binary.Write(w, binary.LittleEndian, hashOk); err != nil {
 		return
 	}
 	bar := pb.StartNew(int(chunks))
